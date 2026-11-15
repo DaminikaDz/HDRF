@@ -1,144 +1,141 @@
-"""Konfigurowalne rozklady HDRF (wersja robocza, PRZED eksperymentem E0).
+"""Rozklady losowania hiperparametrow drzew HDRF (wersja robocza, PRZED E0).
 
-Parametr `max_samples` oznacza tutaj *bootstrap ratio*, takze powyzej 1.0.
-Nie jest to to samo ograniczenie co max_samples w sklearn.RandomForest.
+Losowane grupy (`randomize`):
+
+- ``complexity``: tryb ograniczenia zlozonosci drzewa, losowany per drzewo.
+  * tryb ``depth`` (prawd. ``depth_mode_prob``): max_depth jednostajne na
+    {d_min, ..., D_full}, d_min = ceil(depth_low_coef * log2 n); d = D_full oznacza
+    pelne drzewo (None). min_samples_leaf = 1.
+  * tryb ``leaf``: min_samples_leaf log-jednostajne na {1, ..., leaf_max};
+    leaf = 1 oznacza pelne drzewo. max_depth = None.
+  D_full to szacowana glebokosc pelnego drzewa (mediana z kilku drzew pilotazowych,
+  liczona w forest.fit). min_samples_split jest stale rowne 2.
+- ``criterion``: jednostajnie z listy kryteriow.
+- ``max_features`` (K, liczba cech w wezle): mieszanka F4 + F1. Z prawd.
+  ``features_default_prob`` K = K0, w przeciwnym razie
+  ln K ~ U[ln(K0/a), ln(K0*b)], K zaokraglone i obciete do [1, p].
+  K0 = sqrt(p) (klasyfikacja), p albo p/3 (regresja, ``regression_k0``).
+- ``max_samples`` (BR, bootstrap ratio): jednostajne na ``bootstrap_bounds``;
+  bootstrap ze zwracaniem o rozmiarze BR * n (BR moze byc > 1).
+
+Parametry nielosowane maja wartosci domyslne scikit-learn albo wartosci podane
+jawnie w ``fixed`` (np. srodek z hdrf.center.empirical_center).
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
-from collections.abc import Mapping
 
 import numpy as np
 
 
-HYPERPARAMETERS = (
-    "max_depth",
-    "min_samples_split",
-    "min_samples_leaf",
-    "criterion",
-    "max_features",
-    "max_samples",
-)
+HYPERPARAMETERS = ("complexity", "criterion", "max_features", "max_samples")
+
+# Klucze, ktore mozna ustawic jawnie dla parametrow nielosowanych.
+FIXED_KEYS = ("max_depth", "min_samples_leaf", "criterion", "max_features", "max_samples")
 
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    """Parametry rozkladow i ROBOCZYCH wartosci centralnych (do kalibracji w E0)."""
+    """Stale rozkladow; wartosci sa robocze i do kalibracji w E0."""
 
-    depth_unlimited_prob: float = 0.20
-    depth_offsets: tuple[int, int] = (-2, 4)  # wlacznie z gorna granica
-    split_bounds: tuple[int, int] = (2, 20)
-    leaf_bounds: tuple[int, int] = (1, 10)
+    # complexity
+    depth_mode_prob: float = 0.5
+    depth_low_coef: float = 1.0
+    leaf_max: int = 10
+    n_pilot_trees: int = 5
+    # criterion
     classification_criteria: tuple[str, ...] = ("gini", "entropy")
     regression_criteria: tuple[str, ...] = ("squared_error", "friedman_mse")
-    features_default_prob: float = 0.50
-    features_bounds: tuple[float, float] = (0.50, 1.00)
-    bootstrap_bounds: tuple[float, float] = (0.70, 1.00)
-    fixed_params_mode: Literal["center", "default"] = "center"
-
-    # Punkty centralne na potrzeby porownan. Jeszcze NIE sa medianami z E0.
-    center_depth_offset: int = 2
-    center_split: int = 6
-    center_leaf: int = 3
-    center_classification_features: str | float = "sqrt"
-    center_regression_features: str | float = 1.0
-    center_bootstrap: float = 0.85
+    # max_features
+    features_default_prob: float = 0.3
+    features_down: float = 2.0
+    features_up: float = 2.0
+    regression_k0: Literal["p", "p/3"] = "p"
+    # max_samples
+    bootstrap_bounds: tuple[float, float] = (0.7, 1.0)
 
     def __post_init__(self):
-        if self.fixed_params_mode not in ("center", "default"):
-            raise ValueError(
-                "fixed_params_mode musi byc 'center' albo 'default'"
-            )
-        for name in ("depth_unlimited_prob", "features_default_prob"):
-            prob = getattr(self, name)
-            if not 0 <= prob <= 1:
+        for name in ("depth_mode_prob", "features_default_prob"):
+            if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} musi byc w [0, 1]")
-        if not (isinstance(self.depth_offsets, tuple) and
-                len(self.depth_offsets) == 2 and
-                all(isinstance(v, int) for v in self.depth_offsets) and
-                self.depth_offsets[0] <= self.depth_offsets[1]):
-            raise ValueError("depth_offsets musi byc para rosnacych liczb calkowitych")
-        for name, minimum in (("split_bounds", 2), ("leaf_bounds", 1)):
-            low, high = getattr(self, name)
-            if not (isinstance(low, int) and isinstance(high, int)
-                    and minimum <= low <= high):
-                raise ValueError(f"{name} musi miec calkowite granice >= {minimum}")
-        low, high = self.features_bounds
-        if not 0 < low <= high <= 1:
-            raise ValueError("features_bounds musi byc w przedziale (0, 1]")
+        if self.depth_low_coef <= 0:
+            raise ValueError("depth_low_coef musi byc dodatnie")
+        if not isinstance(self.leaf_max, int) or self.leaf_max < 1:
+            raise ValueError("leaf_max musi byc calkowite >= 1")
+        if not isinstance(self.n_pilot_trees, int) or self.n_pilot_trees < 1:
+            raise ValueError("n_pilot_trees musi byc calkowite >= 1")
+        if self.features_down < 1 or self.features_up < 1:
+            raise ValueError("features_down i features_up musza byc >= 1")
+        if self.regression_k0 not in ("p", "p/3"):
+            raise ValueError("regression_k0 musi byc 'p' albo 'p/3'")
         low, high = self.bootstrap_bounds
         if not 0 < low <= high:
             raise ValueError("bootstrap_bounds musi byc dodatnie i rosnace")
         if not self.classification_criteria or not self.regression_criteria:
             raise ValueError("Listy criterion nie moga byc puste")
-        if self.center_split < 2 or self.center_leaf < 1 or self.center_bootstrap <= 0:
-            raise ValueError("Niepoprawne centralne hiperparametry")
 
 
-def center_params(
-    task: str,
-    n_samples: int,
-    n_features: int,
-    config: SamplingConfig | None = None,
-) -> dict:
-    """Robocze punkty centralne; osobne od rozkladow do pozniejszej kalibracji."""
-    if config is None:
-        config = SamplingConfig()
+def _check_task(task, n_samples, n_features):
     if task not in ("classification", "regression"):
         raise ValueError("task musi byc 'classification' albo 'regression'")
     if n_samples < 2 or n_features < 1:
         raise ValueError("Niepoprawny rozmiar zbioru")
-    anchor = int(np.ceil(np.log2(n_samples)))
+
+
+def sklearn_max_features(task: str, n_features: int) -> int:
+    """K w domyslnym RF scikit-learn: floor(sqrt(p)) albo p."""
+    if task == "classification":
+        return max(1, int(np.sqrt(n_features)))
+    return n_features
+
+
+def k0(task: str, n_features: int, config: SamplingConfig) -> float:
+    """Wartosc odniesienia K0 (rzeczywista, srodek rozkladu w skali log)."""
+    if task == "classification":
+        return float(np.sqrt(n_features))
+    return float(n_features) if config.regression_k0 == "p" else n_features / 3.0
+
+
+def default_params(task: str, n_samples: int, n_features: int) -> dict:
+    """Domyslne hiperparametry RF ze scikit-learn (K jako liczba cech)."""
+    _check_task(task, n_samples, n_features)
     return {
-        "max_depth": max(1, anchor + config.center_depth_offset),
-        "min_samples_split": config.center_split,
-        "min_samples_leaf": config.center_leaf,
-        "criterion": "gini" if task == "classification" else "squared_error",
-        "max_features": (
-            config.center_classification_features if task == "classification"
-            else config.center_regression_features
-        ),
-        "max_samples": config.center_bootstrap,
-    }
-
-
-def default_params(
-    task: str,
-    n_samples: int,
-    n_features: int
-) -> dict:
-    """Domyslne hiperparametry RF ze scikit-learn."""
-
-    if task not in ("classification", "regression"):
-        raise ValueError(
-            "task musi byc 'classification' albo 'regression'"
-        )
-
-    if n_samples < 2 or n_features < 1:
-        raise ValueError("Niepoprawny rozmiar zbioru")
-
-    return {
+        "mode": None,
         "max_depth": None,
         "min_samples_split": 2,
         "min_samples_leaf": 1,
-        "criterion": (
-            "gini"
-            if task == "classification"
-            else "squared_error"
-        ),
-        "max_features": (
-            "sqrt"
-            if task == "classification"
-            else 1.0
-        ),
+        "criterion": "gini" if task == "classification" else "squared_error",
+        "max_features": sklearn_max_features(task, n_features),
         "max_samples": 1.0,
     }
 
 
-def _log_uniform_int(rng: np.random.Generator, low: int, high: int) -> int:
+def depth_bounds(n_samples: int, d_full: int, config: SamplingConfig) -> tuple[int, int]:
+    """Zakres {d_min, ..., d_max} trybu depth; d_max = D_full oznacza pelne drzewo."""
+    d_full = max(1, int(d_full))
+    d_min = int(np.ceil(config.depth_low_coef * np.log2(n_samples)))
+    d_min = min(max(1, d_min), d_full)
+    return d_min, d_full
+
+
+def log_uniform_int(rng: np.random.Generator, low: int, high: int) -> int:
+    """Calkowita log-jednostajna na {low, ..., high}: P(k) ~ ln((k+1)/k)."""
     if low == high:
-        return low
-    return int(np.clip(np.rint(np.exp(rng.uniform(np.log(low), np.log(high)))), low, high))
+        return int(low)
+    value = np.exp(rng.uniform(np.log(low), np.log(high + 1)))
+    return int(min(high, np.floor(value)))
+
+
+def sample_features(rng: np.random.Generator, task: str, n_features: int,
+                    config: SamplingConfig) -> int:
+    base = k0(task, n_features, config)
+    if rng.random() < config.features_default_prob:
+        value = base
+    else:
+        value = np.exp(rng.uniform(np.log(base / config.features_down),
+                                   np.log(base * config.features_up)))
+    return int(np.clip(np.rint(value), 1, n_features))
 
 
 def sample_params(
@@ -148,26 +145,19 @@ def sample_params(
     n_features: int,
     randomize: tuple[str, ...],
     config: SamplingConfig | None = None,
+    d_full: int | None = None,
+    fixed: Mapping | None = None,
 ) -> dict:
-    """Jedna konfiguracja drzewa; RNG per parametr dla kontrolowanych ablacji.
-
-    Dla kompatybilnosci przyjmujemy takze pojedynczy Generator (stare API).
-    """
-
-    if config is None:
-        config = SamplingConfig()
-
-    if config.fixed_params_mode == "default":
-        params = default_params(
-            task, n_samples, n_features
-        )
-    else:
-        params = center_params(
-            task, n_samples, n_features, config
-        )
+    """Konfiguracja jednego drzewa. RNG per grupa (slownik) dla kontrolowanych ablacji."""
+    config = SamplingConfig() if config is None else config
+    params = default_params(task, n_samples, n_features)
+    if fixed:
+        unknown = set(fixed).difference(FIXED_KEYS)
+        if unknown:
+            raise ValueError(f"Nieznane klucze fixed_params: {sorted(unknown)}")
+        params.update(fixed)
 
     enabled = set(randomize)
-
     unknown = enabled.difference(HYPERPARAMETERS)
     if unknown:
         raise ValueError(f"Nieznane hiperparametry: {sorted(unknown)}")
@@ -175,35 +165,30 @@ def sample_params(
     def source(name):
         return rng[name] if isinstance(rng, Mapping) else rng
 
-    anchor = int(np.ceil(np.log2(n_samples)))
-
-    if "max_depth" in enabled:
-        r = source("max_depth")
-        if r.random() < config.depth_unlimited_prob:
-            params["max_depth"] = None
+    if "complexity" in enabled:
+        if d_full is None:
+            raise ValueError("Losowanie complexity wymaga d_full")
+        r = source("complexity")
+        if r.random() < config.depth_mode_prob:
+            low, high = depth_bounds(n_samples, d_full, config)
+            depth = int(r.integers(low, high + 1))
+            params.update(mode="depth", min_samples_leaf=1,
+                          max_depth=None if depth >= high else depth)
         else:
-            low = max(2, anchor + config.depth_offsets[0])
-            high = max(low, anchor + config.depth_offsets[1])
-            params["max_depth"] = int(r.integers(low, high + 1))
-
-    if "min_samples_split" in enabled:
-        params["min_samples_split"] = _log_uniform_int(
-            source("min_samples_split"), *config.split_bounds
-        )
-    if "min_samples_leaf" in enabled:
-        params["min_samples_leaf"] = _log_uniform_int(
-            source("min_samples_leaf"), *config.leaf_bounds
-        )
+            params.update(mode="leaf", max_depth=None,
+                          min_samples_leaf=log_uniform_int(r, 1, config.leaf_max))
     if "criterion" in enabled:
         choices = (config.classification_criteria if task == "classification"
                    else config.regression_criteria)
         params["criterion"] = str(source("criterion").choice(choices))
     if "max_features" in enabled:
-        r = source("max_features")
-        if r.random() >= config.features_default_prob:
-            low, high = config.features_bounds
-            params["max_features"] = float(r.uniform(low, high))
+        params["max_features"] = sample_features(
+            source("max_features"), task, n_features, config)
     if "max_samples" in enabled:
-        low, high = config.bootstrap_bounds
-        params["max_samples"] = float(source("max_samples").uniform(low, high))
+        params["max_samples"] = float(source("max_samples").uniform(*config.bootstrap_bounds))
     return params
+
+
+def tree_kwargs(params: Mapping) -> dict:
+    """Argumenty dla DecisionTree* (bez max_samples i trybu)."""
+    return {k: v for k, v in params.items() if k not in ("max_samples", "mode")}

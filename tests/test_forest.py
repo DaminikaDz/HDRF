@@ -36,9 +36,8 @@ def test_no_randomized_params_means_identical_tree_configs():
 def test_one_randomized_param_only():
     X, y = make_classification(n_samples=150, n_features=6, random_state=1)
     model = HDRFClassifier(n_estimators=30, randomize=("max_samples",), random_state=8).fit(X, y)
-    for parameter in HYPERPARAMETERS:
-        if parameter != "max_samples":
-            assert len({str(p[parameter]) for p in model.tree_params_}) == 1
+    for parameter in ("mode", "max_depth", "min_samples_leaf", "criterion", "max_features"):
+        assert len({str(p[parameter]) for p in model.tree_params_}) == 1
     assert len({p["max_samples"] for p in model.tree_params_}) > 1
 
 
@@ -49,7 +48,9 @@ def test_missing_bootstrap_class_probabilities():
     probabilities = model.predict_proba(X[:3])
     assert probabilities.shape == (3, 2)
     np.testing.assert_allclose(probabilities.sum(axis=1), 1)
-    assert any(len(tree.classes_) == 1 for tree in model.estimators_)
+    # Bootstrap przez wagi: kazde drzewo zna wszystkie klasy; klasa spoza
+    # bootstrapu ma w tym drzewie prawdopodobienstwo 0.
+    assert all(len(tree.classes_) == 2 for tree in model.estimators_)
 
 
 def test_regression_and_sklearn_clone():

@@ -8,124 +8,56 @@ HDRF (*Hyperparameter-Diverse Random Forest*) to własna implementacja lasu loso
 
 | Plik / katalog | Rola |
 | --- | --- |
-| `hdrf/sampling.py` | `SamplingConfig`, parametry domyślne i centralne oraz losowanie hiperparametrów drzew. |
-| `hdrf/forest.py` | Budowa lasu: bootstrap, uczenie drzew CART, agregacja predykcji i rejestrowanie użytych konfiguracji. |
-| `hdrf/__init__.py` | Publiczne importy, m.in. `HDRFClassifier`, `HDRFRegressor`, `SamplingConfig`. |
-| `demo.py` | Demonstracja na danych syntetycznych: klasyfikacja i regresja, wstępne porównania modeli. |
-| `controlled_probe.py` | Kontrolowana diagnostyka `max_features` przy wspólnych ziarnach CART i indeksach bootstrap. |
-| `check_e0_baseline.py` | Kontrola trybów `default` i `center` przy losowaniu jednego hiperparametru. |
-| `fetch_e0.py` | Pobieranie danych i podziałów walidacyjnych z zadań OpenML przewidzianych do E0. |
-| `inspect_e0.py` | Kontrola metadanych zbiorów i integralności podziałów. |
-| `data_loader.py` | Ładowanie lokalnie pobranych danych E0 oraz foldów (`load_e0_task`). |
-| `real_data_smoke_test.py` | Szybkie sprawdzenie uczenia na jednym foldzie rzeczywistych danych. |
-| `real_data_cv.py` | Kontrolne porównanie modeli we wszystkich 10 foldach dwóch pierwszych zbiorów. |
-| `tests/`, `test_data_loader.py` | Testy jednostkowe i testy ładowania danych. |
-| `results/cv_smoke/` | Wyniki kontrolnej CV, po uruchomieniu `real_data_cv.py`. |
+| `hdrf/sampling.py` | `SamplingConfig` i rozkłady losowania hiperparametrów drzew. |
+| `hdrf/forest.py` | Budowa lasu: bootstrap przez wagi, szacowanie D_full, równoległe uczenie drzew CART, agregacja predykcji. |
+| `hdrf/center.py` | Empiryczny środek rozkładów (model RF ze środka). |
+| `fetch_e0.py`, `inspect_e0.py`, `data_loader.py` | Pobieranie, kontrola i ładowanie zadań OpenML dla E0 wraz z oryginalnymi foldami. |
+| `real_data_smoke_test.py` | Szybkie sprawdzenie uczenia na jednym foldzie. |
+| `pilot_e0.py` | Pilotaż rozkładów na credit i Ailerons (10 foldów). Wyniki w `results/pilot_e0/`. |
+| `tests/`, `test_data_loader.py` | Testy jednostkowe. |
 
 ## Instalacja i uruchomienie
 
-Komendy wykonujemy w **PowerShell**, z katalogu `D:\PWW\inzynierka\implementacja`.
+Komendy wykonujemy w **PowerShell**, z katalogu głównego repozytorium. Wymagany Python 3.10 (scikit-learn 1.7.2 wymaga co najmniej 3.10).
 
 ```powershell
 # Jednorazowe utworzenie środowiska, jeśli jeszcze go nie ma:
-py -3.12 -m venv .venv
+py -3.10 -m venv .venv
 
 # Instalacja zależności do środowiska projektu:
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 # Uruchamianie skryptów bez potrzeby aktywacji .venv:
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe demo.py
-.\.venv\Scripts\python.exe controlled_probe.py
-.\.venv\Scripts\python.exe check_e0_baseline.py
 ```
 
-Jeżeli środowisko `.venv` jest już aktywne (w terminalu widać `(.venv)`), zamiast pełnej ścieżki do interpretera można używać po prostu `python`. Jeśli na komputerze nie działa polecenie `py`, utwórz środowisko komendą `python -m venv .venv`, pod warunkiem że `python` wskazuje na zainstalowaną wersję 3.12.
+Jeżeli środowisko `.venv` jest już aktywne (w terminalu widać `(.venv)`), zamiast pełnej ścieżki do interpretera można używać po prostu `python`. Jeśli na komputerze nie działa polecenie `py`, utwórz środowisko komendą `python -m venv .venv`, pod warunkiem że `python` wskazuje na zainstalowaną wersję 3.10.
 
 ## Jak działa HDRF
 
-Każde drzewo otrzymuje własną konfigurację hiperparametrów. Parametr `randomize` określa, **które** z nich mają być losowane. Pozostałe przyjmują wartości stałe zależne od trybu `fixed_params_mode`.
+Każde drzewo dostaje własną konfigurację hiperparametrów. Parametr `randomize` wybiera, które grupy losujemy (domyślnie wszystkie). Pozostałe mają wartości domyślne scikit-learn albo wartości z `fixed_params`.
 
-| Hiperparametr | Co kontroluje |
+| Grupa | Losowanie (stałe w `SamplingConfig`, robocze, do kalibracji w E0) |
 | --- | --- |
-| `max_depth` | Maksymalna głębokość drzewa (`None` oznacza brak narzuconego limitu). |
-| `min_samples_split` | Minimalna liczba obserwacji konieczna do podziału węzła. |
-| `min_samples_leaf` | Minimalna liczba obserwacji w liściu. |
-| `criterion` | Funkcja oceny jakości podziałów. |
-| `max_features` | Liczba / udział cech rozpatrywanych przy podziale. |
-| `max_samples` | Wewnętrzna nazwa stosowanego u nas **bootstrap ratio**. |
+| `complexity` | Tryb per drzewo. **depth** (prawd. `depth_mode_prob`): `max_depth` jednostajne na {⌈c·log₂n⌉, …, D_full}, gdzie D_full oznacza pełne drzewo; liść = 1. **leaf**: `min_samples_leaf` log-jednostajne na {1, …, `leaf_max`}; głębokość bez limitu. D_full to mediana głębokości kilku pełnych drzew pilotażowych. `min_samples_split` = 2 zawsze. |
+| `criterion` | Jednostajnie z {gini, entropy} / {squared_error, friedman_mse}. |
+| `max_features` | Mieszanka: z prawd. `features_default_prob` K = K₀, w przeciwnym razie ln K ~ U[ln(K₀/a), ln(K₀·b)], obcięte do [1, p]. K₀ = √p (klasyfikacja), p albo p/3 (regresja, `regression_k0`). Przy a = b mediana = K₀. |
+| `max_samples` | BR (bootstrap ratio) jednostajny na `bootstrap_bounds`; bootstrap ze zwracaniem o rozmiarze BR·n (BR może być > 1). |
 
-### Dwa tryby wartości niezmienianych (`fixed_params_mode`)
+Bootstrap realizujemy jak scikit-learn: wagami obserwacji (liczba wylosowań), bez kopiowania wierszy. HDRF z `randomize=()` daje wtedy las równoważny `RandomForest` ze scikit-learn.
 
-- **`"default"`** — parametry, których nie losujemy, mają wartości odpowiadające domyślnym ustawieniom `RandomForest` w scikit-learn. Przykładowo: `max_depth=None`, `min_samples_split=2`, `min_samples_leaf=1`, `max_samples=1.0`. Ten tryb jest potrzebny do **E0**, gdy badamy wpływ losowania pojedynczego hiperparametru przy domyślnych wartościach pozostałych.
-- **`"center"`** — parametry, których nie losujemy, przyjmują robocze punkty centralne z `SamplingConfig` (np. `min_samples_split=6`, `min_samples_leaf=3`, `max_samples=0.85`). Jest przydatny do kontrolowanych eksperymentów i przyszłych ablacji, ale **te punkty nie są jeszcze wynikami kalibracji E0**.
-
-**Ważne:** `fixed_params_mode="default"` nie oznacza, że nasz las jest implementacyjnie identyczny z `sklearn.ensemble.RandomForestClassifier`. Wewnętrzny mechanizm losowania i trenowania może się różnić; ustawienia hiperparametrów i zgodność wyników to dwie osobne sprawy.
-
-### Przykłady użycia
+**RF ze środka** (`empirical_center`): K i BR to mediany z samplera (Monte Carlo), `criterion` domyślne. Złożoność: mediana liczby liści M drzew HDRF uczonych na tych samych danych, a potem jedna wartość `min_samples_leaf` (lub `max_depth`), dla której drzewa mają średnio liczbę liści najbliższą M.
 
 ```python
-from dataclasses import replace
-from hdrf import HDRFClassifier, HDRFRegressor, SamplingConfig
+from hdrf import HDRFClassifier, SamplingConfig, empirical_center
 
-base = SamplingConfig()
-
-# 1. Las homogeniczny o roboczych parametrach centralnych.
-homogeneous_center = HDRFClassifier(
-    n_estimators=100,
-    randomize=(),
-    random_state=42,
-    sampling_config=base,
-)
-
-# 2. Przykład E0: losujemy TYLKO max_features;
-#    reszta parametrów ma domyślne wartości RF.
-only_features_e0 = HDRFClassifier(
-    n_estimators=100,
-    randomize=("max_features",),
-    random_state=42,
-    sampling_config=replace(base, fixed_params_mode="default"),
-)
-
-# 3. Kontrolne porównanie z punktem centralnym:
-#    tę samą liczbę drzew i seed zachowujemy w obu wariantach.
-fixed_features = HDRFClassifier(
-    n_estimators=100,
-    randomize=(),
-    random_state=42,
-    sampling_config=replace(base, center_classification_features=0.75),
-)
-
-random_features = HDRFClassifier(
-    n_estimators=100,
-    randomize=("max_features",),
-    random_state=42,
-    sampling_config=base,
-)
-
-# 4. Kandydacka przestrzeń losowania bootstrap ratio nawet powyżej 1.
-#    To przykład konfiguracji, a nie przyjęty wynik kalibracji E0.
-bootstrap2 = HDRFClassifier(
-    n_estimators=100,
-    random_state=42,
-    sampling_config=replace(base, bootstrap_bounds=(0.7, 2.0)),
-)
-
-# Analogiczne warianty są dostępne dla HDRFRegressor.
+hdrf = HDRFClassifier(n_estimators=500, random_state=42, n_jobs=-1).fit(X_train, y_train)
+only_features = HDRFClassifier(500, randomize=("max_features",), random_state=42, n_jobs=-1)
+center, info = empirical_center(X_train, y_train, "classification", reference=hdrf, limit="leaf")
+rf_center = HDRFClassifier(500, randomize=(), fixed_params=center, random_state=42, n_jobs=-1)
 ```
 
-W przykładach utworzono modele, ale ich nie wytrenowano. Do treningu używamy `model.fit(X_train, y_train)`, a do predykcji `model.predict(X_test)`.
-
-### Bootstrap ratio może być większe od 1
-
-W naszym HDRF `max_samples=1.0` oznacza losowanie `n` indeksów **ze zwracaniem** z `n` dostępnych obserwacji, a nie gwarancję użycia wszystkich unikalnych wierszy. Wartość `1.5` oznacza `1.5n` losowań ze zwracaniem i może zwiększyć oczekiwaną liczbę unikalnych obserwacji. Nie oznacza jednak pobrania `150%` unikalnych danych. Taki sposób interpretacji `max_samples` różni się od ograniczeń tego parametru w scikit-learn.
-
-### Powtarzalność i kontrolowane porównania
-
-- `random_state=42` daje odtwarzalny eksperyment. Stosujemy osobne strumienie RNG dla bootstrapu, inicjalizacji drzew oraz losowania hiperparametrów.
-- W porównaniach wariantów implementacji HDRF przy wspólnym seedzie indeksy bootstrap i ziarna CART pozostają zgodne, **o ile nie zmieniamy losowanego rozmiaru bootstrapu**.
-- Po treningu można analizować m.in. `tree_params_`, `bootstrap_info_` i `tree_seeds_`.
-- Gdy `random_state=None`, do ponownego uruchomienia można wykorzystać zapisane `seed_entropy_`.
+Powtarzalność: osobne strumienie RNG dla bootstrapu, ziaren drzew, D_full i każdej grupy hiperparametrów, więc włączenie losowania jednej grupy nie zmienia losowań pozostałych. Wynik nie zależy od `n_jobs`. Po treningu dostępne są `tree_params_`, `bootstrap_info_`, `tree_seeds_`, `d_full_`.
 
 ## OpenML: przygotowanie danych do E0
 
@@ -145,40 +77,16 @@ Skrypty danych:
 .\.venv\Scripts\python.exe inspect_e0.py
 .\.venv\Scripts\python.exe -m pytest -q test_data_loader.py
 .\.venv\Scripts\python.exe real_data_smoke_test.py
-.\.venv\Scripts\python.exe real_data_cv.py
+.\.venv\Scripts\python.exe pilot_e0.py
 ```
 
 Za pobieranie danych i oryginalnych podziałów z OpenML odpowiada `fetch_e0.py`; uruchom go zgodnie z listą zadań i argumentami zdefiniowanymi w skrypcie. **Nie pobieraj od razu wszystkich zbiorów, jeśli chcesz najpierw sprawdzić przetwarzanie dwóch obecnych.**
 
 `load_e0_task` z `data_loader.py` odczytuje **już pobrany zbiór i przygotowane podziały**. To funkcja projektu, a nie biblioteka zewnętrzna ani algorytm HDRF. Jej zadaniem jest udostępnienie tych samych obserwacji i foldów wszystkim porównywanym modelom.
 
-### Kontrolna walidacja krzyżowa (`real_data_cv.py`)
+### Pilotaż rozkładów (`pilot_e0.py`)
 
-Aktualny skrypt przeprowadza 10-fold CV dla dwóch zbiorów (`credit`, `Ailerons`) z `B=100` drzewami i porównuje:
-
-1. `RF default` — bazowy `RandomForest` ze scikit-learn;
-2. `Homogeneous center` — nasz HDRF z `randomize=()` i roboczymi parametrami centralnymi;
-3. `HDRF full` — nasz HDRF z losowaniem wszystkich włączonych hiperparametrów.
-
-**Uwaga metodologiczna:** ta kontrolna CV w obecnej postaci **nie jest jeszcze E0**. W szczególności nie realizuje systematycznego testowania pojedynczych hiperparametrów w trybie `fixed_params_mode="default"`, nie kalibruje rozkładów i korzysta z `B=100`, a nie z docelowego ustawienia E0.
-
-Po zakończeniu skrypt zapisuje pliki:
-
-```text
-results/cv_smoke/361055_folds.csv
-results/cv_smoke/361055_summary.csv
-results/cv_smoke/361077_folds.csv
-results/cv_smoke/361077_summary.csv
-```
-
-Wyniki dotychczasowej diagnostyki (średnia z 10 foldów):
-
-| Zbiór, miara | RF default | Homogeneous center | HDRF full |
-| --- | ---: | ---: | ---: |
-| `credit`, accuracy ↑ | 0.77085 | 0.77594 | 0.77498 |
-| `Ailerons`, RMSE ↓ | 0.00016169 | 0.00016200 | 0.00016189 |
-
-Różnice są niewielkie; tych dwóch porównań nie traktujemy jako dowodu przewagi którejkolwiek metody.
+Na credit i Ailerons, 10 foldów OpenML, B = 500: RF domyślny, losowanie każdej grupy osobno, pełny HDRF, tryby złożoności osobno, RF ze środka (leaf i depth), w regresji także K₀ = p/3. To nie jest E0: dwa zbiory i robocze stałe.
 
 ## Co pozostaje do zrobienia
 
@@ -186,6 +94,6 @@ Różnice są niewielkie; tych dwóch porównań nie traktujemy jako dowodu prze
 2. Zaimplementować właściwy protokół **E0**: badanie rozkładów pojedynczych hiperparametrów, porównania wariantów i wybór docelowych przestrzeni losowania na zbiorach rozwojowych.
 3. Po zakończeniu E0 **zamrozić konfigurację HDRF** przed walidacją na nowych zbiorach (E1–E3).
 4. Uzupełnić analizę statystyczną, różnorodność drzew i koszt obliczeniowy zgodnie z protokołem pracy.
-5. Rozważyć rozszerzenia techniczne: `n_jobs`, OOB score, `sample_weight`, obsługę macierzy sparse.
+5. Rozważyć rozszerzenia techniczne: OOB score (potrzebny w E2* i E3), `sample_weight`, obsługę macierzy sparse.
 
 **Najważniejsza zasada eksperymentalna:** wyniki na zbiorach przeznaczonych do końcowej oceny nie mogą służyć do dobierania rozkładów HDRF. Kalibrację przeprowadzamy tylko w ramach E0.

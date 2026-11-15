@@ -1,16 +1,56 @@
 """HDRF v2: kontrolowane losowanie, bootstrap o dowolnym dodatnim ratio.
 
-Wciaz wersja sekwencyjna: bez joblib, OOB score, sample_weight, sparse.
+Bootstrap jak w scikit-learn: wagi obserwacji = liczba wylosowan (bez kopiowania
+wierszy). Drzewa uczone rownolegle (joblib, watki). Bez OOB score, sample_weight
+uzytkownika i macierzy sparse.
 """
 
 from numbers import Integral
 
 import numpy as np
+from joblib import Parallel, delayed
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
-from .sampling import HYPERPARAMETERS, SamplingConfig, sample_params
+from .sampling import (
+    HYPERPARAMETERS, SamplingConfig, default_params, sample_params, tree_kwargs,
+)
+
+
+def bootstrap_weights(seed, size, n_samples):
+    """Wagi bootstrapu: ile razy wylosowano kazda obserwacje (jak w scikit-learn)."""
+    indices = np.random.default_rng(seed).integers(0, n_samples, size=size)
+    return np.bincount(indices, minlength=n_samples).astype(np.float64)
+
+
+def _fit_tree(tree_cls, X, y, params, info, seed):
+    weights = bootstrap_weights(info["seed"], info["size"], info["train_size"])
+    tree = tree_cls(**tree_kwargs(params), random_state=seed)
+    # Obserwacje z waga 0 (spoza bootstrapu) sa pomijane przez splitter CART.
+    return tree.fit(X, y, sample_weight=weights)
+
+
+def estimate_full_depth(tree_cls, X, y, task, n_trees, seed_seq, n_jobs=None):
+    """Mediana glebokosci pelnych drzew (hiperparametry domyslne RF) na bootstrapach."""
+    n_samples, n_features = X.shape
+    params = default_params(task, n_samples, n_features)
+    rng = np.random.default_rng(seed_seq)
+    jobs = []
+    for _ in range(n_trees):
+        info = {"seed": int(rng.integers(0, 2**31 - 1)), "size": n_samples,
+                "train_size": n_samples}
+        jobs.append((info, int(rng.integers(0, 2**31 - 1))))
+    trees = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_fit_tree)(tree_cls, X, y, params, info, seed) for info, seed in jobs
+    )
+    return int(np.median([tree.get_depth() for tree in trees]))
+
+
+def _tree_predictions(estimators, X, method, n_jobs):
+    return Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(getattr(tree, method))(X) for tree in estimators
+    )
 
 
 class _HDRFBase(BaseEstimator):
@@ -25,11 +65,15 @@ class _HDRFBase(BaseEstimator):
         randomize=HYPERPARAMETERS,
         random_state=None,
         sampling_config=None,
+        n_jobs=None,
+        fixed_params=None,
     ):
         self.n_estimators = n_estimators
         self.randomize = randomize
         self.random_state = random_state
         self.sampling_config = sampling_config
+        self.n_jobs = n_jobs
+        self.fixed_params = fixed_params
 
     def fit(self, X, y):
         if (isinstance(self.n_estimators, bool)
@@ -56,17 +100,20 @@ class _HDRFBase(BaseEstimator):
             raise ValueError("random_state musi byc nieujemna liczba calkowita lub None")
 
         X, y = check_X_y(
-            X, y, dtype=np.float64, ensure_all_finite="allow-nan",
+            X, y, dtype=np.float32, ensure_all_finite="allow-nan",
             y_numeric=(self._task == "regression"),
         )
         n_samples, self.n_features_in_ = X.shape
         if self._task == "classification":
-            self.classes_ = np.unique(y)
+            # Kodujemy etykiety raz (0..K-1); drzewa ucza sie na kodach, co omija
+            # kosztowne kodowanie etykiet tekstowych w kazdym drzewie.
+            self.classes_, y = np.unique(y, return_inverse=True)
+            y = y.astype(np.float64)
 
         # Stala kolejnosc strumieni, niezalezna od randomize / liczby drzew.
         root = np.random.SeedSequence(self.random_state)
         self.seed_entropy_ = root.entropy  # przy random_state=None pozwala odtworzyc trening
-        child_seeds = root.spawn(2 + len(HYPERPARAMETERS))
+        child_seeds = root.spawn(3 + len(HYPERPARAMETERS))
         bootstrap_rng = np.random.default_rng(child_seeds[0])
         tree_rng = np.random.default_rng(child_seeds[1])
         param_rngs = {
@@ -74,29 +121,28 @@ class _HDRFBase(BaseEstimator):
             for i, name in enumerate(HYPERPARAMETERS)
         }
 
-        self.estimators_ = []
+        # D_full: mediana glebokosci kilku pelnych drzew (domyslne RF) na bootstrapach.
+        self.d_full_ = None
+        if "complexity" in enabled:
+            self.d_full_ = estimate_full_depth(
+                self._tree_cls, X, y, self._task, config.n_pilot_trees,
+                child_seeds[2 + len(HYPERPARAMETERS)], self.n_jobs,
+            )
+
+        # Najpierw (sekwencyjnie) losujemy konfiguracje i ziarna: wynik nie zalezy od n_jobs.
         self.tree_params_ = []
         self.bootstrap_info_ = []
         self.tree_seeds_ = []
-
         for _ in range(int(self.n_estimators)):
             params = sample_params(
                 param_rngs, self._task, n_samples, self.n_features_in_,
-                enabled, config=config,
+                enabled, config=config, d_full=self.d_full_,
+                fixed=self.fixed_params,
             )
             bootstrap_seed = int(bootstrap_rng.integers(0, 2**31 - 1))
             tree_seed = int(tree_rng.integers(0, 2**31 - 1))
-
             # Nie ograniczamy do n: max_samples jest ratio i moze byc > 1.
             bootstrap_size = max(1, int(round(params["max_samples"] * n_samples)))
-            indices = np.random.default_rng(bootstrap_seed).integers(
-                0, n_samples, size=bootstrap_size
-            )
-            tree_kwargs = {key: value for key, value in params.items() if key != "max_samples"}
-            tree = self._tree_cls(**tree_kwargs, random_state=tree_seed)
-            tree.fit(X[indices], y[indices])
-
-            self.estimators_.append(tree)
             self.tree_params_.append(params)
             self.bootstrap_info_.append({
                 "seed": bootstrap_seed,
@@ -104,11 +150,18 @@ class _HDRFBase(BaseEstimator):
                 "train_size": n_samples,
             })
             self.tree_seeds_.append(tree_seed)
+
+        self.estimators_ = Parallel(n_jobs=self.n_jobs, prefer="threads")(
+            delayed(_fit_tree)(self._tree_cls, X, y, params, info, seed)
+            for params, info, seed in zip(
+                self.tree_params_, self.bootstrap_info_, self.tree_seeds_
+            )
+        )
         return self
 
     def _validated_prediction_input(self, X, n_trees):
         check_is_fitted(self, "estimators_")
-        X = check_array(X, dtype=np.float64, ensure_all_finite="allow-nan")
+        X = check_array(X, dtype=np.float32, ensure_all_finite="allow-nan")
         if X.shape[1] != self.n_features_in_:
             raise ValueError(f"Oczekiwano {self.n_features_in_} cech, otrzymano {X.shape[1]}")
         if n_trees is None:
@@ -129,10 +182,11 @@ class HDRFClassifier(ClassifierMixin, _HDRFBase):
 
     def predict_proba(self, X, n_trees=None):
         X, count = self._validated_prediction_input(X, n_trees)
+        trees = self.estimators_[:count]
         probabilities = np.zeros((X.shape[0], len(self.classes_)), dtype=np.float64)
-        for tree in self.estimators_[:count]:
-            positions = np.searchsorted(self.classes_, tree.classes_)
-            probabilities[:, positions] += tree.predict_proba(X)
+        for tree, part in zip(trees, _tree_predictions(trees, X, "predict_proba", self.n_jobs)):
+            positions = tree.classes_.astype(np.intp)
+            probabilities[:, positions] += part
         return probabilities / count
 
     def predict(self, X, n_trees=None):
@@ -148,7 +202,8 @@ class HDRFRegressor(RegressorMixin, _HDRFBase):
 
     def predict(self, X, n_trees=None):
         X, count = self._validated_prediction_input(X, n_trees)
+        trees = self.estimators_[:count]
         predictions = np.zeros(X.shape[0], dtype=np.float64)
-        for tree in self.estimators_[:count]:
-            predictions += tree.predict(X)
+        for part in _tree_predictions(trees, X, "predict", self.n_jobs):
+            predictions += part
         return predictions / count
