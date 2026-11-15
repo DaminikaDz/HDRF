@@ -3,9 +3,11 @@
 Losowane grupy (`randomize`):
 
 - ``complexity``: tryb ograniczenia zlozonosci drzewa, losowany per drzewo.
-  * tryb ``depth`` (prawd. ``depth_mode_prob``): max_depth jednostajne na
-    {d_min, ..., D_full}, d_min = ceil(depth_low_coef * log2 n); d = D_full oznacza
-    pelne drzewo (None). min_samples_leaf = 1.
+  * tryb ``depth`` (prawd. ``depth_mode_prob``): max_depth na {d_min, ..., D_full},
+    d_min = ceil(depth_low_coef * log2 n); d = D_full oznacza pelne drzewo (None).
+    ``depth_distribution``: 'uniform' (jednostajnie) albo 'log_full'
+    (log-jednostajnie z grubym ogonem przy D_full: D_full + 1 - d ~ log-jedn.).
+    min_samples_leaf = 1.
   * tryb ``leaf``: min_samples_leaf log-jednostajne na {1, ..., leaf_max};
     leaf = 1 oznacza pelne drzewo. max_depth = None.
   D_full to szacowana glebokosc pelnego drzewa (mediana z kilku drzew pilotazowych,
@@ -32,7 +34,7 @@ import numpy as np
 HYPERPARAMETERS = ("complexity", "criterion", "max_features", "max_samples")
 
 # Klucze, ktore mozna ustawic jawnie dla parametrow nielosowanych.
-FIXED_KEYS = ("max_depth", "min_samples_leaf", "criterion", "max_features", "max_samples")
+FIXED_KEYS = ("max_depth", "min_samples_leaf", "max_leaf_nodes", "criterion", "max_features", "max_samples")
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class SamplingConfig:
     # complexity
     depth_mode_prob: float = 0.5
     depth_low_coef: float = 1.0
+    depth_distribution: Literal["uniform", "log_full"] = "uniform"
     leaf_max: int = 10
     n_pilot_trees: int = 5
     # criterion
@@ -61,6 +64,8 @@ class SamplingConfig:
                 raise ValueError(f"{name} musi byc w [0, 1]")
         if self.depth_low_coef <= 0:
             raise ValueError("depth_low_coef musi byc dodatnie")
+        if self.depth_distribution not in ("uniform", "log_full"):
+            raise ValueError("depth_distribution musi byc 'uniform' albo 'log_full'")
         if not isinstance(self.leaf_max, int) or self.leaf_max < 1:
             raise ValueError("leaf_max musi byc calkowite >= 1")
         if not isinstance(self.n_pilot_trees, int) or self.n_pilot_trees < 1:
@@ -105,6 +110,7 @@ def default_params(task: str, n_samples: int, n_features: int) -> dict:
         "max_depth": None,
         "min_samples_split": 2,
         "min_samples_leaf": 1,
+        "max_leaf_nodes": None,
         "criterion": "gini" if task == "classification" else "squared_error",
         "max_features": sklearn_max_features(task, n_features),
         "max_samples": 1.0,
@@ -171,7 +177,10 @@ def sample_params(
         r = source("complexity")
         if r.random() < config.depth_mode_prob:
             low, high = depth_bounds(n_samples, d_full, config)
-            depth = int(r.integers(low, high + 1))
+            if config.depth_distribution == "uniform":
+                depth = int(r.integers(low, high + 1))
+            else:
+                depth = high + 1 - log_uniform_int(r, 1, high - low + 1)
             params.update(mode="depth", min_samples_leaf=1,
                           max_depth=None if depth >= high else depth)
         else:

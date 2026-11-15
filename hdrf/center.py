@@ -3,9 +3,10 @@
 - max_features i max_samples: mediany brzegowe z samplera (Monte Carlo).
 - criterion: wartosc domyslna (gini / squared_error).
 - zlozonosc: mediana liczby lisci M drzew HDRF (z wytrenowanego HDRF albo z lasu
-  pilotazowego), a nastepnie jedna wartosc max_depth albo min_samples_leaf, dla
-  ktorej drzewa ze srodkowymi K i BR maja srednio liczbe lisci najblizsza M
-  (w skali logarytmicznej).
+  pilotazowego). Domyslnie (limit='leaves') max_leaf_nodes = M, co daje dokladne
+  dopasowanie. Wersje 'leaf' / 'depth': jedna wartosc min_samples_leaf albo
+  max_depth, dla ktorej drzewa ze srodkowymi K i BR maja srednio liczbe lisci
+  najblizsza M (w skali log); siatka calkowita bywa za gruba.
 """
 
 import numpy as np
@@ -44,19 +45,19 @@ def _mean_leaves(tree_cls, X, y, params, n_trees, rng):
 
 
 def empirical_center(
-    X, y, task, config=None, reference=None, limit="leaf",
+    X, y, task, config=None, reference=None, limit="leaves",
     n_reference_trees=100, n_calibration_trees=4, random_state=0,
 ):
     """Parametry RF ze srodka dla danej czesci treningowej.
 
     reference: wytrenowany HDRF (complexity losowane) na tych samych danych; jesli
     None, uczymy pilotazowy HDRF z n_reference_trees drzewami.
-    limit: 'leaf' (srodek przez min_samples_leaf) albo 'depth' (przez max_depth).
+    limit: 'leaves' (max_leaf_nodes = M), 'leaf' (min_samples_leaf) albo 'depth'.
     Zwraca (fixed_params, info).
     """
     config = SamplingConfig() if config is None else config
-    if limit not in ("leaf", "depth"):
-        raise ValueError("limit musi byc 'leaf' albo 'depth'")
+    if limit not in ("leaves", "leaf", "depth"):
+        raise ValueError("limit musi byc 'leaves', 'leaf' albo 'depth'")
     model_cls = HDRFClassifier if task == "classification" else HDRFRegressor
     if reference is None:
         reference = model_cls(n_estimators=n_reference_trees, random_state=random_state,
@@ -74,6 +75,11 @@ def empirical_center(
     center.update(marginal_medians(task, n_samples, n_features, config, seed=random_state))
     tree_cls = reference._tree_cls
 
+    if limit == "leaves":
+        center["max_leaf_nodes"] = max(2, int(round(target)))
+        center.pop("mode")
+        center.pop("min_samples_split")
+        return center, {"target_leaves": target, "limit": limit, "d_full": reference.d_full_}
     if limit == "leaf":
         candidates = list(range(1, config.leaf_max + 1))
         key = "min_samples_leaf"

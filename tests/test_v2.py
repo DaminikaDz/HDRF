@@ -97,7 +97,7 @@ def test_bootstrap_ratio_above_one():
 def test_empirical_center():
     X, y = _classification()
     ref = HDRFClassifier(40, random_state=0, n_jobs=2).fit(X, y)
-    for limit in ("leaf", "depth"):
+    for limit in ("leaves", "leaf", "depth"):
         center, info = empirical_center(X, y, "classification", reference=ref, limit=limit)
         assert center["criterion"] == "gini"
         assert center["max_features"] == 4
@@ -105,6 +105,20 @@ def test_empirical_center():
         assert info["target_leaves"] > 1
         model = HDRFClassifier(5, randomize=(), fixed_params=center, random_state=0).fit(X, y)
         assert np.isfinite(model.predict_proba(X)).all()
+        if limit == "leaves":
+            assert center["max_leaf_nodes"] == round(info["target_leaves"])
+            assert all(t.get_n_leaves() <= center["max_leaf_nodes"] for t in model.estimators_)
+
+
+def test_depth_log_full_has_fat_tail_at_full_tree():
+    rng = np.random.default_rng(0)
+    cfg = SamplingConfig(depth_mode_prob=1.0, depth_distribution="log_full")
+    draws = [sample_params(rng, "classification", 10000, 10, ("complexity",), config=cfg,
+                           d_full=30)["max_depth"] for _ in range(20000)]
+    counts = Counter(draws)
+    assert set(counts) <= set(range(14, 30)) | {None}
+    assert counts[None] / len(draws) == pytest.approx(np.log(2) / np.log(18), abs=0.01)
+    assert counts[None] > counts[29] > counts[20] > counts[14]
 
 
 def test_sklearn_clone_with_config():
