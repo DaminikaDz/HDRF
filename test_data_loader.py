@@ -32,7 +32,7 @@ def create_example(root, task_id=361055, task_type="classification", extra_featu
               "@ATTRIBUTE rowid NUMERIC\n@ATTRIBUTE type {TRAIN,TEST}\n@DATA\n" + "\n".join(split_records) + "\n")
     (folder / "splits.arff").write_text(splits)
     manifest = {"role":"E0 development", "task_id":task_id, "target_from_task":"goal",
-                "expected_name_from_M2":"example", "expected_rows_from_M2": 50_001 if big else 20,
+                "expected_name_from_M2":"example", "expected_rows_from_M2": 20,
                 "expected_features_after_J1_from_M2":2 if not extra_feature else 3}
     (folder / "manifest.json").write_text(json.dumps(manifest))
 
@@ -64,16 +64,35 @@ def test_bad_split_rejected(tmp_path):
         load_e0_task(361055, root=tmp_path)
 
 
-def test_categorical_not_silently_encoded(tmp_path):
+def test_categorical_ordinal_encoding(tmp_path):
     create_example(tmp_path, extra_feature=True)
-    with pytest.raises(NotImplementedError, match="Ordinal encoding"):
-        load_e0_task(361055, root=tmp_path)
+    task = load_e0_task(361055, root=tmp_path)
+    assert task.X.shape == (20, 3)
+    # Kolejnosc poziomow z naglowka ARFF: a -> 0, b -> 1.
+    np.testing.assert_array_equal(task.X[:4, 2], [1.0, 0.0, 1.0, 0.0])
 
 
-def test_j7_not_silently_ignored(tmp_path):
-    create_example(tmp_path, big=True)
-    with pytest.raises(NotImplementedError, match="J7"):
-        load_e0_task(361055, root=tmp_path)
+def test_j1_drops_constant_column(tmp_path):
+    create_example(tmp_path, extra_feature=True)
+    folder = tmp_path / "classification" / "361055_example"
+    text = (folder / "data.arff").read_text().replace(",a,", ",b,")  # kolumna 'cat' stala
+    (folder / "data.arff").write_text(text)
+    manifest = json.loads((folder / "manifest.json").read_text())
+    manifest["expected_features_after_J1_from_M2"] = 2
+    (folder / "manifest.json").write_text(json.dumps(manifest))
+    assert load_e0_task(361055, root=tmp_path).X.shape == (20, 2)
+
+
+def test_j7_subsample_keeps_original_folds(tmp_path, monkeypatch):
+    import data_loader
+    create_example(tmp_path)
+    monkeypatch.setattr(data_loader, "J7_MAX_ROWS", 12)
+    task = load_e0_task(361055, root=tmp_path)
+    assert task.X.shape == (12, 2)
+    tests = np.concatenate([f.test_idx for f in task.folds])
+    assert np.array_equal(np.sort(tests), np.arange(12))  # nadal podzial na rozlaczne foldy
+    for f in task.folds:  # kazdy zachowany wiersz zostal w swoim oryginalnym foldzie
+        assert set(task.X[f.test_idx, 0] // 2) <= {float(f.fold)}
 
 
 def test_missing_task(tmp_path):

@@ -1,8 +1,13 @@
 """Read downloaded OpenML E0 tasks and their original cross-validation folds.
 
-For now this loader supports only numeric, already-clean datasets (credit and
-Ailerons). It intentionally refuses to encode categorical data, apply J1/J7,
-or invent new train/test splits. These are separate, auditable processing steps.
+Preprocessing (as in the M2 data report):
+- J1: drop columns with > 50% missing values, constant columns and ID-like
+  columns listed in J1_ID_COLUMNS (from the M2 quality report).
+- Categorical (nominal) features: ordinal encoding in the order of levels
+  declared in the ARFF header; missing values stay NaN (no imputation).
+- J7: n > 50,000 -> uniform subsample of 50,000 rows (fixed seed); every kept
+  row keeps its original OpenML fold, so test folds still partition the data.
+Train/test splits are always the original OpenML folds.
 
 Usage from the project root::
 
@@ -26,6 +31,10 @@ from scipy.io import arff
 
 
 DEFAULT_ROOT = Path("data/e0/raw")
+J7_MAX_ROWS = 50_000
+J7_SEED = 0
+# ID-like columns found in the M2 quality report (kol_typu_id).
+J1_ID_COLUMNS = {361070: ("lineNo",)}
 
 
 @dataclass(frozen=True)
@@ -60,7 +69,7 @@ class E0Task:
         )
 
 
-def _read_arff(folder: Path, stem: str) -> pd.DataFrame:
+def _read_arff(folder: Path, stem: str, with_meta: bool = False):
     """Open a single .arff or .arff.gz file without changing column ordering."""
     candidates = [folder / f"{stem}.arff", folder / f"{stem}.arff.gz"]
     present = [path for path in candidates if path.is_file()]
@@ -71,7 +80,7 @@ def _read_arff(folder: Path, stem: str) -> pd.DataFrame:
     path = present[0]
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8", errors="replace") as stream:
-        records, _ = arff.loadarff(stream)
+        records, meta = arff.loadarff(stream)
     frame = pd.DataFrame.from_records(records)
 
     # scipy.io.arff returns nominal values as bytes.
@@ -80,10 +89,10 @@ def _read_arff(folder: Path, stem: str) -> pd.DataFrame:
             lambda value: value.decode("utf-8", errors="replace")
             if isinstance(value, bytes) else value
         )
-    return frame
+    return (frame, meta) if with_meta else frame
 
 
-def _load_splits(folder: Path, n_rows: int) -> tuple[OpenMLFold, ...]:
+def _load_splits(folder: Path, n_rows: int, keep: np.ndarray | None = None) -> tuple[OpenMLFold, ...]:
     splits = _read_arff(folder, "splits")
     required = {"repeat", "fold", "rowid", "type"}
     if not required.issubset(splits.columns):
@@ -116,6 +125,20 @@ def _load_splits(folder: Path, n_rows: int) -> tuple[OpenMLFold, ...]:
     if len(folds) != 10 or {f.repeat for f in folds} != {0} or {f.fold for f in folds} != set(range(10)):
         raise ValueError("E0 expects exactly 10 folds: repeat=0, fold=0..9")
 
+    if keep is not None:
+        # J7: restrict every fold to the kept rows and renumber them 0..len(keep)-1.
+        new_index = np.full(n_rows, -1, dtype=np.int64)
+        new_index[keep] = np.arange(len(keep))
+        folds = [
+            OpenMLFold(f.repeat, f.fold,
+                       new_index[f.train_idx[new_index[f.train_idx] >= 0]],
+                       new_index[f.test_idx[new_index[f.test_idx] >= 0]])
+            for f in folds
+        ]
+        n_rows = len(keep)
+        if any(not len(f.train_idx) or not len(f.test_idx) for f in folds):
+            raise ValueError("Empty fold after J7 subsampling")
+
     # In 10-fold CV, every observation is test data exactly once.
     test_frequency = np.bincount(np.concatenate([f.test_idx for f in folds]), minlength=n_rows)
     if not np.all(test_frequency == 1):
@@ -124,11 +147,7 @@ def _load_splits(folder: Path, n_rows: int) -> tuple[OpenMLFold, ...]:
 
 
 def load_e0_task(task_id: int, root: Path | str = DEFAULT_ROOT) -> E0Task:
-    """Load one *raw*, numeric E0 task with original folds and strict validation.
-
-    Does not perform categorical encoding, J1 column removal or J7 subsampling.
-    Instead, raises an explanatory error when one of those steps is needed.
-    """
+    """Load one E0 task: J1, ordinal encoding, J7 and the original OpenML folds."""
     root = Path(root)
     matches = sorted(root.glob(f"*/{int(task_id)}_*"))
     if len(matches) != 1:
@@ -144,31 +163,35 @@ def load_e0_task(task_id: int, root: Path | str = DEFAULT_ROOT) -> E0Task:
     if task_type not in {"classification", "regression"}:
         raise ValueError(f"Unknown task type: {task_type}")
 
-    # Stop rather than silently skipping mandatory J7 preprocessing.
-    if manifest.get("expected_rows_from_M2", 0) > 50_000:
-        raise NotImplementedError(
-            f"Task {task_id} requires J7 subsampling to 50,000 rows "
-            "and consistent remapping of OpenML folds (not yet implemented)."
-        )
-
-    data = _read_arff(folder, "data")
+    data, meta = _read_arff(folder, "data", with_meta=True)
     target = manifest["target_from_task"]
     if target not in data.columns:
         raise ValueError(f"Target column {target!r} not found in {folder}")
     if data.columns.duplicated().any():
         raise ValueError("Duplicate feature names in ARFF")
-
-    features = data.drop(columns=[target])
-    if features.shape[1] != manifest.get("expected_features_after_J1_from_M2"):
-        raise ValueError("Feature count differs from M2 after J1; preprocessing is required")
     if len(data) != manifest.get("expected_rows_from_M2"):
         raise ValueError("Row count differs from M2; verify the downloaded dataset")
 
+    features = data.drop(columns=[target])
+    # Ordinal encoding of nominal features (ARFF level order); '?' / unknown -> NaN.
+    for column in features.columns:
+        kind, levels = meta[column]
+        if kind == "nominal":
+            codes = {level: float(i) for i, level in enumerate(levels)}
+            features[column] = features[column].map(codes).astype(np.float64)
     non_numeric = list(features.select_dtypes(exclude="number").columns)
     if non_numeric:
-        raise NotImplementedError(
-            f"Task {task_id} contains categorical/non-numeric columns: {non_numeric[:8]}. "
-            "Ordinal encoding has not been implemented yet."
+        raise NotImplementedError(f"Unsupported non-numeric columns: {non_numeric[:8]}")
+
+    # J1: > 50% missing, constant, ID-like.
+    drop = [c for c in features.columns
+            if features[c].isna().mean() > 0.5 or features[c].nunique(dropna=True) <= 1]
+    drop += [c for c in J1_ID_COLUMNS.get(int(task_id), ()) if c in features.columns]
+    features = features.drop(columns=sorted(set(drop)))
+    if features.shape[1] != manifest.get("expected_features_after_J1_from_M2"):
+        raise ValueError(
+            f"Feature count after J1 ({features.shape[1]}) differs from M2 "
+            f"({manifest.get('expected_features_after_J1_from_M2')})"
         )
     X = features.to_numpy(dtype=np.float64)
     if np.isinf(X).any():
@@ -186,7 +209,11 @@ def load_e0_task(task_id: int, root: Path | str = DEFAULT_ROOT) -> E0Task:
         if len(np.unique(y)) < 2:
             raise ValueError("Classification requires at least two classes")
 
-    folds = _load_splits(folder, n_rows=len(data))
+    keep = None
+    if len(data) > J7_MAX_ROWS:
+        keep = np.sort(np.random.RandomState(J7_SEED).choice(len(data), J7_MAX_ROWS, replace=False))
+        X, y = X[keep], y[keep]
+    folds = _load_splits(folder, n_rows=len(data), keep=keep)
     return E0Task(
         task_id=int(task_id), name=manifest["expected_name_from_M2"],
         task_type=task_type, feature_names=tuple(features.columns),
