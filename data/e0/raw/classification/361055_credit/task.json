@@ -1,0 +1,80 @@
+{
+  "task": {
+    "task_id": "361055",
+    "task_name": "Task 361055: credit (Supervised Classification)",
+    "task_type_id": "1",
+    "task_type": "Supervised Classification",
+    "input": [
+      {
+        "name": "source_data",
+        "data_set": {
+          "data_set_id": "44089",
+          "target_feature": "SeriousDlqin2yrs"
+        }
+      },
+      {
+        "name": "estimation_procedure",
+        "estimation_procedure": {
+          "id": "1",
+          "type": "crossvalidation",
+          "data_splits_url": "https://openml.org/api_splits/get/361055/Task_361055_splits.arff",
+          "parameter": [
+            {
+              "name": "number_repeats",
+              "value": "1"
+            },
+            {
+              "name": "number_folds",
+              "value": "10"
+            },
+            {
+              "name": "percentage"
+            },
+            {
+              "name": "stratified_sampling",
+              "value": "true"
+            }
+          ]
+        }
+      },
+      {
+        "name": "cost_matrix",
+        "cost_matrix": []
+      },
+      {
+        "name": "evaluation_measures",
+        "evaluation_measures": {
+          "evaluation_measure": "predictive_accuracy"
+        }
+      }
+    ],
+    "output": {
+      "name": "predictions",
+      "predictions": {
+        "format": "ARFF",
+        "feature": [
+          {
+            "name": "repeat",
+            "type": "integer"
+          },
+          {
+            "name": "fold",
+            "type": "integer"
+          },
+          {
+            "name": "row_id",
+            "type": "integer"
+          },
+          {
+            "name": "confidence.classname",
+            "type": "numeric"
+          },
+          {
+            "name": "prediction",
+            "type": "string"
+          }
+        ]
+      }
+    }
+  }
+}

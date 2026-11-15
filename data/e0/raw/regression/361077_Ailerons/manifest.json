@@ -1,0 +1,14 @@
+{
+  "role": "E0 development",
+  "task_id": 361077,
+  "dataset_id": 44137,
+  "expected_name_from_M2": "Ailerons",
+  "dataset_name_openml": "Ailerons",
+  "expected_rows_from_M2": 13750,
+  "expected_features_after_J1_from_M2": 33,
+  "target_from_task": "goal",
+  "split_procedure": "crossvalidation",
+  "raw_data_url": "https://openml.org/data/v1/download/22103262/Ailerons.arff",
+  "original_split_url": "https://openml.org//api_splits/get/361077/Task_361077_splits.arff",
+  "preprocessing_applied": false
+}

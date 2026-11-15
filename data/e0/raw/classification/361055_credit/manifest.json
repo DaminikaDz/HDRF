@@ -1,0 +1,14 @@
+{
+  "role": "E0 development",
+  "task_id": 361055,
+  "dataset_id": 44089,
+  "expected_name_from_M2": "credit",
+  "dataset_name_openml": "credit",
+  "expected_rows_from_M2": 16714,
+  "expected_features_after_J1_from_M2": 10,
+  "target_from_task": "SeriousDlqin2yrs",
+  "split_procedure": "crossvalidation",
+  "raw_data_url": "https://openml.org/data/v1/download/22103185/credit.arff",
+  "original_split_url": "https://openml.org/api_splits/get/361055/Task_361055_splits.arff",
+  "preprocessing_applied": false
+}
