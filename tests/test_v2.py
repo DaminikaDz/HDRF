@@ -51,21 +51,18 @@ def test_complexity_modes_never_limit_twice():
     assert depth_bounds(10000, 10, cfg) == (10, 10)
 
 
-def test_max_features_median_is_k0_when_symmetric():
+def test_max_features_range_and_mass_at_p():
     rng = np.random.default_rng(2)
-    cfg = SamplingConfig(features_down=2.0, features_up=2.0)
-    for p in (10, 33, 100):
-        ks = [sample_params(rng, "classification", 1000, p, ("max_features",), cfg)["max_features"]
-              for _ in range(4000)]
-        assert int(np.median(ks)) == int(np.rint(np.sqrt(p)))
-        assert min(ks) >= max(1, int(np.rint(np.sqrt(p) / 2))) and max(ks) <= p
-
-
-def test_regression_k0_variants():
-    rng = np.random.default_rng(3)
-    for k0, expected in (("p", 33), ("p/3", 11)):
-        cfg = SamplingConfig(regression_k0=k0, features_default_prob=1.0)
-        assert sample_params(rng, "regression", 500, 33, ("max_features",), cfg)["max_features"] == expected
+    for task in ("classification", "regression"):
+        for a, w in ((2.0, 0.65), (4.0, 0.3)):
+            cfg = SamplingConfig(features_down=a, features_full_prob=w)
+            ks = np.array([sample_params(rng, task, 1000, 100, ("max_features",), cfg)["max_features"]
+                           for _ in range(8000)])
+            assert ks.min() >= round(100 / a) and ks.max() == 100
+            assert abs(np.mean(ks == 100) - w) < 0.02
+            # Reszta log-jednostajnie: polowa ponizej sredniej geometrycznej p/a i p.
+            rest = ks[ks < 100]
+            assert abs(np.mean(rest < 100 / np.sqrt(a)) - 0.5) < 0.04
 
 
 def test_fixed_params_and_defaults():
@@ -100,7 +97,7 @@ def test_empirical_center():
     for limit in ("leaves", "leaf", "depth"):
         center, info = empirical_center(X, y, "classification", reference=ref, limit=limit)
         assert center["criterion"] == "gini"
-        assert center["max_features"] == 4
+        assert center["max_features"] == X.shape[1]
         assert 0.7 <= center["max_samples"] <= 1.0
         assert info["target_leaves"] > 1
         model = HDRFClassifier(5, randomize=(), fixed_params=center, random_state=0).fit(X, y)
@@ -134,18 +131,19 @@ def test_input_validation():
     with pytest.raises(ValueError):
         SamplingConfig(features_down=0.5)
     with pytest.raises(ValueError):
-        SamplingConfig(regression_k0="p/2")
+        SamplingConfig(features_full_prob=1.5)
     with pytest.raises(ValueError):
         HDRFClassifier(random_state=-1).fit(X, y)
     with pytest.raises(ValueError):
         HDRFClassifier(sampling_config={}).fit(X, y)
     Xr, yr = make_regression(n_samples=120, n_features=5, random_state=1)
-    HDRFRegressor(5, random_state=0, sampling_config=replace(SamplingConfig(), regression_k0="p/3")).fit(Xr, yr)
+    HDRFRegressor(5, random_state=0, sampling_config=replace(SamplingConfig(), features_down=3.0)).fit(Xr, yr)
 
 
 def test_splitter_group():
     X, y = _classification()
-    base = HDRFClassifier(30, random_state=3).fit(X, y)
+    base = HDRFClassifier(30, random_state=3,
+                          sampling_config=SamplingConfig(splitter_random_prob=0.0)).fit(X, y)
     assert all(p["splitter"] == "best" for p in base.tree_params_)
     cfg = SamplingConfig(splitter_random_prob=0.5)
     mixed = HDRFClassifier(30, random_state=3, sampling_config=cfg).fit(X, y)
@@ -164,11 +162,3 @@ def test_seed_streams_backward_compatible():
     new = np.random.SeedSequence(42).spawn(8)
     assert all(a.generate_state(2).tolist() == b.generate_state(2).tolist()
                for a, b in zip(old, new))
-
-
-def test_classification_k0_p():
-    rng = np.random.default_rng(0)
-    cfg = SamplingConfig(classification_k0="p")
-    ks = [sample_params(rng, "classification", 1000, 40, ("max_features",), config=cfg)["max_features"]
-          for _ in range(5000)]
-    assert min(ks) >= 20 and max(ks) == 40 and np.median(ks) == 40

@@ -2,7 +2,7 @@
 
 HDRF (*Hyperparameter-Diverse Random Forest*) to własna implementacja lasu losowego, w którym każde drzewo CART może mieć niezależnie wylosowane hiperparametry. Projekt służy do zbadania, czy heterogeniczność drzew wpływa na jakość predykcji, różnorodność modeli i koszt obliczeniowy.
 
-**Status:** prototyp działa dla klasyfikacji i regresji; przygotowano pobieranie danych OpenML, ich odczyt oraz kontrolną walidację krzyżową. **Rozkłady losowania nie zostały jeszcze skalibrowane w E0.** Dotychczasowe wyniki to diagnostyka implementacji, nie końcowe rezultaty pracy.
+**Status:** prototyp działa dla klasyfikacji i regresji; przygotowano pobieranie danych OpenML, ich odczyt oraz kontrolną walidację krzyżową. **Sposoby losowania są wybrane (wariant A_p, pilotaże w `pilotaze_etap1/`), stałe rozkładów czekają na kalibrację w E0.** Dotychczasowe wyniki to diagnostyka implementacji, nie końcowe rezultaty pracy.
 
 ## Struktura projektu
 
@@ -11,9 +11,10 @@ HDRF (*Hyperparameter-Diverse Random Forest*) to własna implementacja lasu loso
 | `hdrf/sampling.py` | `SamplingConfig` i rozkłady losowania hiperparametrów drzew. |
 | `hdrf/forest.py` | Budowa lasu: bootstrap przez wagi, szacowanie D_full, równoległe uczenie drzew CART, agregacja predykcji. |
 | `hdrf/center.py` | Empiryczny środek rozkładów (model RF ze środka). |
+| `hdrf/diagnostics.py` | Miary jakości (`score`) i diagnostyka drzew: siła, korelacja błędów, ambiguity (`tree_diagnostics`). |
 | `fetch_e0.py`, `inspect_e0.py`, `data_loader.py` | Pobieranie, kontrola i ładowanie zadań OpenML dla E0 wraz z oryginalnymi foldami. |
 | `real_data_smoke_test.py` | Szybkie sprawdzenie uczenia na jednym foldzie. |
-| `pilot_e0.py` | Pilotaż rozkładów na credit i Ailerons (10 foldów). Wyniki w `results/pilot_e0/`. |
+| `pilotaze_etap1/` | Archiwum pilotaży, którymi wybraliśmy sposoby losowania (opis i wnioski w `pilotaze_etap1/README.md`). |
 | `tests/`, `test_data_loader.py` | Testy jednostkowe. |
 
 ## Instalacja i uruchomienie
@@ -39,21 +40,24 @@ Każde drzewo dostaje własną konfigurację hiperparametrów. Parametr `randomi
 
 | Grupa | Losowanie (stałe w `SamplingConfig`, robocze, do kalibracji w E0) |
 | --- | --- |
-| `complexity` | Tryb per drzewo. **depth** (prawd. `depth_mode_prob`): `max_depth` jednostajne na {⌈c·log₂n⌉, …, D_full}, gdzie D_full oznacza pełne drzewo; liść = 1. **leaf**: `min_samples_leaf` log-jednostajne na {1, …, `leaf_max`}; głębokość bez limitu. D_full to mediana głębokości kilku pełnych drzew pilotażowych. `min_samples_split` = 2 zawsze. |
+| `complexity` | Tryb per drzewo. **depth** (prawd. `depth_mode_prob`): `max_depth` na {⌈c·log₂n⌉, …, D_full}, gdzie D_full oznacza pełne drzewo; rozkład `log_full`: D_full + 1 − d log-jednostajne (gruby ogon przy pełnym drzewie); liść = 1. **leaf**: `min_samples_leaf` log-jednostajne na {1, …, `leaf_max`}; głębokość bez limitu. D_full to mediana głębokości kilku pełnych drzew pilotażowych. `min_samples_split` = 2 zawsze. |
 | `criterion` | Jednostajnie z {gini, entropy} / {squared_error, friedman_mse}. |
-| `max_features` | Mieszanka: z prawd. `features_default_prob` K = K₀, w przeciwnym razie ln K ~ U[ln(K₀/a), ln(K₀·b)], obcięte do [1, p]. K₀ = √p (klasyfikacja), p albo p/3 (regresja, `regression_k0`). Przy a = b mediana = K₀. |
+| `splitter` | Z prawd. `splitter_random_prob` (π) losowy próg jak w Extra Trees (`random`), w przeciwnym razie `best`. |
+| `max_features` | K ∈ [p/a, p] w obu zadaniach: z prawd. w (`features_full_prob`) K = p, w przeciwnym razie ln K ~ U[ln(p/a), ln p), a = `features_down`. |
 | `max_samples` | BR (bootstrap ratio) jednostajny na `bootstrap_bounds`; bootstrap ze zwracaniem o rozmiarze BR·n (BR może być > 1). |
 
 Bootstrap realizujemy jak scikit-learn: wagami obserwacji (liczba wylosowań), bez kopiowania wierszy. HDRF z `randomize=()` daje wtedy las równoważny `RandomForest` ze scikit-learn.
 
-**RF ze środka** (`empirical_center`): K i BR to mediany z samplera (Monte Carlo), `criterion` domyślne. Złożoność: mediana liczby liści M drzew HDRF uczonych na tych samych danych, a potem jedna wartość `min_samples_leaf` (lub `max_depth`), dla której drzewa mają średnio liczbę liści najbliższą M.
+Domyślne stałe (wariant A_p): P(depth) = 0.5, c = 1, `leaf_max` = 5, π = 0.5, a = 2, w = 0.65, BR ∈ [0.7, 1.0].
+
+**RF ze środka** (`empirical_center`): K i BR to mediany z samplera (Monte Carlo), `criterion` domyślne, `splitter` = best. Złożoność: `max_leaf_nodes` = mediana liczby liści M drzew HDRF uczonych na tych samych danych (`limit="leaves"`, domyślnie); opcjonalnie jedna wartość `min_samples_leaf` lub `max_depth` (`limit="leaf"`/`"depth"`).
 
 ```python
 from hdrf import HDRFClassifier, SamplingConfig, empirical_center
 
 hdrf = HDRFClassifier(n_estimators=500, random_state=42, n_jobs=-1).fit(X_train, y_train)
 only_features = HDRFClassifier(500, randomize=("max_features",), random_state=42, n_jobs=-1)
-center, info = empirical_center(X_train, y_train, "classification", reference=hdrf, limit="leaf")
+center, info = empirical_center(X_train, y_train, "classification", reference=hdrf)
 rf_center = HDRFClassifier(500, randomize=(), fixed_params=center, random_state=42, n_jobs=-1)
 ```
 
@@ -77,16 +81,11 @@ Skrypty danych:
 .\.venv\Scripts\python.exe inspect_e0.py
 .\.venv\Scripts\python.exe -m pytest -q test_data_loader.py
 .\.venv\Scripts\python.exe real_data_smoke_test.py
-.\.venv\Scripts\python.exe pilot_e0.py
 ```
 
 Za pobieranie danych i oryginalnych podziałów z OpenML odpowiada `fetch_e0.py`; uruchom go zgodnie z listą zadań i argumentami zdefiniowanymi w skrypcie. **Nie pobieraj od razu wszystkich zbiorów, jeśli chcesz najpierw sprawdzić przetwarzanie dwóch obecnych.**
 
 `load_e0_task` z `data_loader.py` odczytuje **już pobrany zbiór i przygotowane podziały**. To funkcja projektu, a nie biblioteka zewnętrzna ani algorytm HDRF. Jej zadaniem jest udostępnienie tych samych obserwacji i foldów wszystkim porównywanym modelom.
-
-### Pilotaż rozkładów (`pilot_e0.py`)
-
-Na credit i Ailerons, 10 foldów OpenML, B = 500: RF domyślny, losowanie każdej grupy osobno, pełny HDRF, tryby złożoności osobno, RF ze środka (leaf i depth), w regresji także K₀ = p/3. To nie jest E0: dwa zbiory i robocze stałe.
 
 ## Co pozostaje do zrobienia
 
