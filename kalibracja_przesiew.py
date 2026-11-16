@@ -41,15 +41,19 @@ FULL = {"classification": ("results/pilot_k_p", "HDRF A_p (pi=0.5)"),
 FULL_RF = ("results/pilot_dev16", "results/pilot_e0")
 
 
+def lhs_points(ranges, n_points):
+    """n_points punktow LHS (Latin hypercube) przeskalowanych do zakresow `ranges`."""
+    lows, highs = zip(*ranges.values())
+    unit = qmc.LatinHypercube(d=len(ranges), seed=LHS_SEED, optimization="random-cd").random(n_points)
+    return qmc.scale(unit, lows, highs)
+
+
 def make_configs(n_lhs):
     base = SamplingConfig()
     configs = {REFERENCE: base,
                "A_p leaf_max=3": replace(base, leaf_max=3),
                "A_p leaf_max=10": replace(base, leaf_max=10)}
-    lows, highs = zip(*RANGES.values())
-    points = qmc.scale(qmc.LatinHypercube(d=len(RANGES), seed=LHS_SEED,
-                                          optimization="random-cd").random(n_lhs), lows, highs)
-    for i, (pi, a, w, br_low) in enumerate(points):
+    for i, (pi, a, w, br_low) in enumerate(lhs_points(RANGES, n_lhs)):
         configs[f"LHS{i:02d}"] = replace(base, splitter_random_prob=float(pi), features_down=float(a),
                                          features_full_prob=float(w),
                                          bootstrap_bounds=(float(br_low), 1.0))
@@ -59,7 +63,8 @@ def make_configs(n_lhs):
 def constants(config):
     return {"pi": config.splitter_random_prob, "a": config.features_down,
             "w": config.features_full_prob, "br_low": config.bootstrap_bounds[0],
-            "leaf_max": config.leaf_max}
+            "p_depth": config.depth_mode_prob, "c": config.depth_low_coef,
+            "leaf_max": config.leaf_max, "depth_dist": config.depth_distribution}
 
 
 def run_task(task_id, configs, n_trees, n_folds, out_dir):
@@ -97,6 +102,8 @@ def full_protocol(task_type):
     """Zysk A_p wzgledem RF w pelnym protokole (B = 500), na wszystkich foldach i na `folds`."""
     folder, model = FULL[task_type]
     frames = [pd.read_csv(p) for p in Path(folder).glob("*_folds.csv")]
+    if not frames:  # brak wynikow pilotazy (np. inny komputer)
+        return None
     for rf_folder in FULL_RF:
         frames += [pd.read_csv(p) for p in Path(rf_folder).glob("*_folds.csv")]
     df = pd.concat(frames, ignore_index=True)
@@ -113,7 +120,7 @@ def gains_vs_rf(df, metric, lower_better):
     return diff.drop(columns=RF).groupby(level="dataset").mean()
 
 
-def summarize(out_dir, n_folds):
+def summarize(out_dir, n_folds, ranges=RANGES):
     files = sorted(out_dir.glob("*_folds.csv"))
     if not files:
         return
@@ -124,7 +131,8 @@ def summarize(out_dir, n_folds):
         if sub.empty:
             continue
         n_sets = sub.dataset.nunique()
-        consts = (sub[sub.config != RF].groupby("config")[list(RANGES) + ["leaf_max"]].first())
+        cols = [c for c in constants(SamplingConfig()) if c in sub]
+        consts = sub[sub.config != RF].groupby("config")[cols].first()
         out = consts.copy()
         for metric, lower_better in metrics.items():
             means = sub[sub.config != RF].pivot_table(index="dataset", columns="config", values=metric)
@@ -143,11 +151,13 @@ def summarize(out_dir, n_folds):
             lines.append(out.drop(columns="task_type").to_string(float_format=lambda v: f"{v:.4g}"))
         lhs = out[out.index.str.startswith("LHS") | (out.index == REFERENCE)]
         lines.append("  Spearman: stala vs srednia ranga (ujemny = wieksza wartosc lepsza)")
-        for const in RANGES:
+        for const in ranges:
             rho, p = spearmanr(lhs[const], lhs["rank srednia"])
             lines.append(f"    {const}: rho = {rho:+.2f} (p = {p:.3f})")
         # A_p: ograniczony vs pelny protokol (czy przesiew mowi to samo).
         full = full_protocol(task_type)
+        if full is None:
+            continue
         full = full[full.dataset.isin(sub.dataset.unique())]
         for metric, lower_better in metrics.items():
             limited = gains_vs_rf(sub, metric, lower_better)[REFERENCE]
@@ -162,25 +172,25 @@ def summarize(out_dir, n_folds):
     print("\n".join(lines), flush=True)
 
 
-def main():
+def main(build_configs=make_configs, ranges=RANGES, default_out="results/kalibracja_przesiew"):
     parser = argparse.ArgumentParser()
     parser.add_argument("--configs", type=int, default=20)
     parser.add_argument("--trees", type=int, default=150)
     parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--out", type=Path, default=Path("results/kalibracja_przesiew"))
+    parser.add_argument("--out", type=Path, default=Path(default_out))
     parser.add_argument("--tasks", type=int, nargs="*", default=TASKS)
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    configs = make_configs(args.configs)
+    configs = build_configs(args.configs)
     pd.DataFrame({n: constants(c) for n, c in configs.items()}).T.to_csv(args.out / "configs.csv")
     if not args.summary_only:
         for task_id in args.tasks:
             if (args.out / f"{task_id}_folds.csv").exists():
                 continue  # wznowienie po przerwaniu
             run_task(task_id, configs, args.trees, args.folds, args.out)
-            summarize(args.out, args.folds)
-    summarize(args.out, args.folds)
+            summarize(args.out, args.folds, ranges)
+    summarize(args.out, args.folds, ranges)
 
 
 if __name__ == "__main__":
