@@ -56,9 +56,16 @@ def tree_diagnostics(model, X_test, y_test, classification):
             resid = y_test - t.predict(X_test.astype(np.float32))
             errors.append(resid)
             scores.append(np.sqrt(np.mean(resid ** 2)))
-    corr = np.corrcoef(np.vstack(errors))
+    errors = np.vstack(errors)
+    corr = np.corrcoef(errors)
     off_diag = corr[~np.eye(len(trees), dtype=bool)]
-    return {"tree_score": float(np.mean(scores)), "tree_corr": float(np.nanmean(off_diag))}
+    # Ambiguity (Krogh-Vedelsby): blad^2 lasu = sredni blad^2 drzewa - ambiguity,
+    # gdzie ambiguity = sredni rozrzut predykcji drzew wokol predykcji lasu.
+    # amb_share = jaka czesc bledu drzewa usuwa usrednianie (0 = brak roznorodnosci).
+    tree_mse = float(np.mean(errors ** 2))
+    ambiguity = float(np.mean(errors.var(axis=0)))
+    return {"tree_score": float(np.mean(scores)), "tree_corr": float(np.nanmean(off_diag)),
+            "ambiguity": ambiguity, "amb_share": ambiguity / tree_mse}
 
 
 def run_task(task_id, n_trees, n_folds, out_dir):

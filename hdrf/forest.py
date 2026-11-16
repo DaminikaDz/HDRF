@@ -18,6 +18,10 @@ from .sampling import (
 )
 
 
+_STREAMS = {"complexity": 2, "criterion": 3, "max_features": 4, "max_samples": 5,
+            "d_full": 6, "splitter": 7}
+
+
 def bootstrap_weights(seed, size, n_samples):
     """Wagi bootstrapu: ile razy wylosowano kazda obserwacje (jak w scikit-learn)."""
     indices = np.random.default_rng(seed).integers(0, n_samples, size=size)
@@ -113,12 +117,14 @@ class _HDRFBase(BaseEstimator):
         # Stala kolejnosc strumieni, niezalezna od randomize / liczby drzew.
         root = np.random.SeedSequence(self.random_state)
         self.seed_entropy_ = root.entropy  # przy random_state=None pozwala odtworzyc trening
-        child_seeds = root.spawn(3 + len(HYPERPARAMETERS))
+        # Indeksy strumieni sa stale: nowe grupy dopisujemy na koncu, zeby nie
+        # zmieniac losowan wczesniejszych wersji (spawn(n)[i] nie zalezy od n).
+        child_seeds = root.spawn(len(_STREAMS) + 2)
         bootstrap_rng = np.random.default_rng(child_seeds[0])
         tree_rng = np.random.default_rng(child_seeds[1])
         param_rngs = {
-            name: np.random.default_rng(child_seeds[i + 2])
-            for i, name in enumerate(HYPERPARAMETERS)
+            name: np.random.default_rng(child_seeds[_STREAMS[name]])
+            for name in HYPERPARAMETERS
         }
 
         # D_full: mediana glebokosci kilku pelnych drzew (domyslne RF) na bootstrapach.
@@ -126,7 +132,7 @@ class _HDRFBase(BaseEstimator):
         if "complexity" in enabled:
             self.d_full_ = estimate_full_depth(
                 self._tree_cls, X, y, self._task, config.n_pilot_trees,
-                child_seeds[2 + len(HYPERPARAMETERS)], self.n_jobs,
+                child_seeds[_STREAMS["d_full"]], self.n_jobs,
             )
 
         # Najpierw (sekwencyjnie) losujemy konfiguracje i ziarna: wynik nie zalezy od n_jobs.

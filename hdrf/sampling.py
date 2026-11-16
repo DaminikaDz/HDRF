@@ -13,10 +13,15 @@ Losowane grupy (`randomize`):
   D_full to szacowana glebokosc pelnego drzewa (mediana z kilku drzew pilotazowych,
   liczona w forest.fit). min_samples_split jest stale rowne 2.
 - ``criterion``: jednostajnie z listy kryteriow.
+- ``splitter``: z prawd. ``splitter_random_prob`` 'random' (losowy prog dla kazdej
+  z K cech, jak w Extra Trees), w przeciwnym razie 'best'. Domyslnie 0, czyli
+  zawsze 'best' (zachowanie jak przed dodaniem grupy).
 - ``max_features`` (K, liczba cech w wezle): mieszanka F4 + F1. Z prawd.
   ``features_default_prob`` K = K0, w przeciwnym razie
   ln K ~ U[ln(K0/a), ln(K0*b)], K zaokraglone i obciete do [1, p].
-  K0 = sqrt(p) (klasyfikacja), p albo p/3 (regresja, ``regression_k0``).
+  K0 = sqrt(p) albo p (klasyfikacja, ``classification_k0``), p albo p/3
+  (regresja, ``regression_k0``). Przy K0 = p gorna czesc rozkladu jest obcinana
+  do p, wiec K lezy w [p/a, p] z duza masa w p.
 - ``max_samples`` (BR, bootstrap ratio): jednostajne na ``bootstrap_bounds``;
   bootstrap ze zwracaniem o rozmiarze BR * n (BR moze byc > 1).
 
@@ -31,10 +36,11 @@ from typing import Literal
 import numpy as np
 
 
-HYPERPARAMETERS = ("complexity", "criterion", "max_features", "max_samples")
+HYPERPARAMETERS = ("complexity", "criterion", "max_features", "max_samples", "splitter")
 
 # Klucze, ktore mozna ustawic jawnie dla parametrow nielosowanych.
-FIXED_KEYS = ("max_depth", "min_samples_leaf", "max_leaf_nodes", "criterion", "max_features", "max_samples")
+FIXED_KEYS = ("max_depth", "min_samples_leaf", "max_leaf_nodes", "criterion", "max_features",
+              "max_samples", "splitter")
 
 
 @dataclass(frozen=True)
@@ -50,16 +56,19 @@ class SamplingConfig:
     # criterion
     classification_criteria: tuple[str, ...] = ("gini", "entropy")
     regression_criteria: tuple[str, ...] = ("squared_error", "friedman_mse")
+    # splitter
+    splitter_random_prob: float = 0.0
     # max_features
     features_default_prob: float = 0.3
     features_down: float = 2.0
     features_up: float = 2.0
     regression_k0: Literal["p", "p/3"] = "p"
+    classification_k0: Literal["sqrt", "p"] = "sqrt"
     # max_samples
     bootstrap_bounds: tuple[float, float] = (0.7, 1.0)
 
     def __post_init__(self):
-        for name in ("depth_mode_prob", "features_default_prob"):
+        for name in ("depth_mode_prob", "features_default_prob", "splitter_random_prob"):
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} musi byc w [0, 1]")
         if self.depth_low_coef <= 0:
@@ -72,6 +81,8 @@ class SamplingConfig:
             raise ValueError("n_pilot_trees musi byc calkowite >= 1")
         if self.features_down < 1 or self.features_up < 1:
             raise ValueError("features_down i features_up musza byc >= 1")
+        if self.classification_k0 not in ("sqrt", "p"):
+            raise ValueError("classification_k0 musi byc 'sqrt' albo 'p'")
         if self.regression_k0 not in ("p", "p/3"):
             raise ValueError("regression_k0 musi byc 'p' albo 'p/3'")
         low, high = self.bootstrap_bounds
@@ -98,7 +109,7 @@ def sklearn_max_features(task: str, n_features: int) -> int:
 def k0(task: str, n_features: int, config: SamplingConfig) -> float:
     """Wartosc odniesienia K0 (rzeczywista, srodek rozkladu w skali log)."""
     if task == "classification":
-        return float(np.sqrt(n_features))
+        return float(np.sqrt(n_features)) if config.classification_k0 == "sqrt" else float(n_features)
     return float(n_features) if config.regression_k0 == "p" else n_features / 3.0
 
 
@@ -112,6 +123,7 @@ def default_params(task: str, n_samples: int, n_features: int) -> dict:
         "min_samples_leaf": 1,
         "max_leaf_nodes": None,
         "criterion": "gini" if task == "classification" else "squared_error",
+        "splitter": "best",
         "max_features": sklearn_max_features(task, n_features),
         "max_samples": 1.0,
     }
@@ -190,6 +202,9 @@ def sample_params(
         choices = (config.classification_criteria if task == "classification"
                    else config.regression_criteria)
         params["criterion"] = str(source("criterion").choice(choices))
+    if "splitter" in enabled:
+        random = source("splitter").random() < config.splitter_random_prob
+        params["splitter"] = "random" if random else "best"
     if "max_features" in enabled:
         params["max_features"] = sample_features(
             source("max_features"), task, n_features, config)

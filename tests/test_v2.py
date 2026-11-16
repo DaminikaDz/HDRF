@@ -141,3 +141,34 @@ def test_input_validation():
         HDRFClassifier(sampling_config={}).fit(X, y)
     Xr, yr = make_regression(n_samples=120, n_features=5, random_state=1)
     HDRFRegressor(5, random_state=0, sampling_config=replace(SamplingConfig(), regression_k0="p/3")).fit(Xr, yr)
+
+
+def test_splitter_group():
+    X, y = _classification()
+    base = HDRFClassifier(30, random_state=3).fit(X, y)
+    assert all(p["splitter"] == "best" for p in base.tree_params_)
+    cfg = SamplingConfig(splitter_random_prob=0.5)
+    mixed = HDRFClassifier(30, random_state=3, sampling_config=cfg).fit(X, y)
+    kinds = {p["splitter"] for p in mixed.tree_params_}
+    assert kinds == {"best", "random"}
+    assert {t.splitter for t in mixed.estimators_} == kinds
+    # Pozostale grupy i D_full nie zmieniaja sie po wlaczeniu losowego splittera.
+    strip = lambda ps: [{k: v for k, v in p.items() if k != "splitter"} for p in ps]
+    assert strip(base.tree_params_) == strip(mixed.tree_params_)
+    assert base.d_full_ == mixed.d_full_
+
+
+def test_seed_streams_backward_compatible():
+    root = np.random.SeedSequence(42)
+    old = root.spawn(7)
+    new = np.random.SeedSequence(42).spawn(8)
+    assert all(a.generate_state(2).tolist() == b.generate_state(2).tolist()
+               for a, b in zip(old, new))
+
+
+def test_classification_k0_p():
+    rng = np.random.default_rng(0)
+    cfg = SamplingConfig(classification_k0="p")
+    ks = [sample_params(rng, "classification", 1000, 40, ("max_features",), config=cfg)["max_features"]
+          for _ in range(5000)]
+    assert min(ks) >= 20 and max(ks) == 40 and np.median(ks) == 40
