@@ -162,3 +162,34 @@ def test_seed_streams_backward_compatible():
     new = np.random.SeedSequence(42).spawn(8)
     assert all(a.generate_state(2).tolist() == b.generate_state(2).tolist()
                for a, b in zip(old, new))
+
+
+def test_signal_rule_off_by_default_and_paired():
+    X, y = _classification()
+    base = HDRFClassifier(20, random_state=3).fit(X, y)
+    assert base.signal_ is None and base.effective_config_ == SamplingConfig()
+    for rule, leaf, depth in [("leaf", 2, 0.5), ("leaf_depth", 2, 0.7)]:
+        cfg = SamplingConfig(signal_rule=rule, signal_threshold=0.0)  # zawsze "silny sygnal"
+        m = HDRFClassifier(20, random_state=3, sampling_config=cfg).fit(X, y)
+        assert 0 <= m.signal_ <= 1
+        assert m.effective_config_.leaf_max == leaf
+        assert m.effective_config_.depth_mode_prob == depth
+        # Pozostale strumienie bez zmian: te same K, bootstrapy, ziarna, D_full.
+        assert [p["max_features"] for p in m.tree_params_] == [p["max_features"] for p in base.tree_params_]
+        assert m.bootstrap_info_ == base.bootstrap_info_ and m.d_full_ == base.d_full_
+    weak = HDRFClassifier(20, random_state=3,
+                          sampling_config=SamplingConfig(signal_rule="leaf", signal_threshold=1.01)).fit(X, y)
+    assert weak.effective_config_.leaf_max == 12
+
+
+def test_signal_estimate_tracks_noise():
+    from hdrf.forest import estimate_signal
+    from sklearn.tree import DecisionTreeRegressor
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(600, 5))
+    clean = X[:, 0] * 3 + X[:, 1]
+    seq = np.random.SeedSequence(1)
+    s_clean = estimate_signal(DecisionTreeRegressor, X.astype(np.float32), clean, "regression", 30, seq)
+    s_noisy = estimate_signal(DecisionTreeRegressor, X.astype(np.float32),
+                              clean + rng.normal(scale=6, size=600), "regression", 30, seq)
+    assert s_clean > 0.8 and s_noisy < 0.4

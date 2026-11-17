@@ -14,12 +14,13 @@ from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
 from .sampling import (
-    HYPERPARAMETERS, SamplingConfig, default_params, sample_params, tree_kwargs,
+    HYPERPARAMETERS, SamplingConfig, apply_signal_rule, default_params, sample_params,
+    tree_kwargs,
 )
 
 
 _STREAMS = {"complexity": 2, "criterion": 3, "max_features": 4, "max_samples": 5,
-            "d_full": 6, "splitter": 7}
+            "d_full": 6, "splitter": 7, "signal": 8}
 
 
 def bootstrap_weights(seed, size, n_samples):
@@ -49,6 +50,48 @@ def estimate_full_depth(tree_cls, X, y, task, n_trees, seed_seq, n_jobs=None):
         delayed(_fit_tree)(tree_cls, X, y, params, info, seed) for info, seed in jobs
     )
     return int(np.median([tree.get_depth() for tree in trees]))
+
+
+def estimate_signal(tree_cls, X, y, task, n_trees, seed_seq, n_jobs=None):
+    """Sila sygnalu: wynik OOB lasu z domyslnymi hiperparametrami RF.
+
+    Klasyfikacja: OOB accuracy (y zakodowane 0..C-1), regresja: OOB R^2. Liczone na
+    obserwacjach, ktore byly poza bootstrapem co najmniej jednego drzewa.
+    """
+    n_samples, n_features = X.shape
+    params = default_params(task, n_samples, n_features)
+    rng = np.random.default_rng(seed_seq)
+    jobs = []
+    for _ in range(n_trees):
+        info = {"seed": int(rng.integers(0, 2**31 - 1)), "size": n_samples,
+                "train_size": n_samples}
+        jobs.append((info, int(rng.integers(0, 2**31 - 1))))
+    trees = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_fit_tree)(tree_cls, X, y, params, info, seed) for info, seed in jobs
+    )
+    classification = task == "classification"
+    n_classes = int(y.max()) + 1 if classification else 1
+    total = np.zeros((n_samples, n_classes))
+    counts = np.zeros(n_samples)
+    for tree, (info, _) in zip(trees, jobs):
+        oob = bootstrap_weights(info["seed"], info["size"], n_samples) == 0
+        if not oob.any():
+            continue
+        if classification:
+            proba = tree.predict_proba(X[oob])
+            total[np.ix_(oob, tree.classes_.astype(int))] += proba
+        else:
+            total[oob, 0] += tree.predict(X[oob])
+        counts[oob] += 1
+    seen = counts > 0
+    if not seen.any():
+        return float("nan")
+    if classification:
+        return float(np.mean(total[seen].argmax(axis=1) == y[seen]))
+    pred = total[seen, 0] / counts[seen]
+    resid = np.sum((y[seen] - pred) ** 2)
+    spread = np.sum((y[seen] - y[seen].mean()) ** 2)
+    return float(1 - resid / spread) if spread > 0 else 0.0
 
 
 def _tree_predictions(estimators, X, method, n_jobs):
@@ -134,6 +177,16 @@ class _HDRFBase(BaseEstimator):
                 self._tree_cls, X, y, self._task, config.n_pilot_trees,
                 child_seeds[_STREAMS["d_full"]], self.n_jobs,
             )
+
+        # Regula sygnalu (eksperymentalna): stale zlozonosci zalezne od wyniku OOB pilotazu.
+        self.signal_ = None
+        if "complexity" in enabled and config.signal_rule != "none":
+            self.signal_ = estimate_signal(
+                self._tree_cls, X, y, self._task, config.n_signal_trees,
+                child_seeds[_STREAMS["signal"]], self.n_jobs,
+            )
+            config = apply_signal_rule(config, self.signal_)
+        self.effective_config_ = config
 
         # Najpierw (sekwencyjnie) losujemy konfiguracje i ziarna: wynik nie zalezy od n_jobs.
         self.tree_params_ = []

@@ -20,12 +20,15 @@ Losowane grupy (`randomize`), kazda z osobnego strumienia losowego:
 - ``max_samples`` (BR, bootstrap ratio): jednostajne na ``bootstrap_bounds``;
   bootstrap ze zwracaniem o rozmiarze BR * n (BR moze byc > 1).
 
+Eksperymentalnie (``signal_rule``): leaf_max (i ewentualnie depth_mode_prob) zalezne
+od sygnalu w danych, mierzonego wynikiem OOB lasu pilotazowego (forest.estimate_signal).
+
 Parametry nielosowane maja wartosci domyslne scikit-learn albo wartosci podane
 jawnie w ``fixed`` (np. srodek z hdrf.center.empirical_center).
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import numpy as np
@@ -58,8 +61,24 @@ class SamplingConfig:
     features_full_prob: float = 0.65  # w
     # max_samples
     bootstrap_bounds: tuple[float, float] = (0.7, 1.0)
+    # Regula zalezna od sygnalu (eksperymentalna): s = OOB accuracy (klas.) / OOB R^2 (regr.)
+    # lasu pilotazowego z domyslnymi hiperparametrami RF. s >= prog -> drzewa pelniejsze.
+    # 'none': stale jak wyzej; 'leaf': tylko leaf_max; 'leaf_depth': leaf_max i depth_mode_prob.
+    signal_rule: Literal["none", "leaf", "leaf_depth"] = "none"
+    signal_threshold: float = 0.78
+    signal_leaf_max: tuple[int, int] = (12, 2)  # (s < prog, s >= prog)
+    signal_depth_prob: tuple[float, float] = (0.3, 0.7)  # (s < prog, s >= prog)
+    n_signal_trees: int = 100
 
     def __post_init__(self):
+        if self.signal_rule not in ("none", "leaf", "leaf_depth"):
+            raise ValueError("signal_rule musi byc 'none', 'leaf' albo 'leaf_depth'")
+        if not isinstance(self.n_signal_trees, int) or self.n_signal_trees < 1:
+            raise ValueError("n_signal_trees musi byc calkowite >= 1")
+        if any(not isinstance(v, int) or v < 1 for v in self.signal_leaf_max):
+            raise ValueError("signal_leaf_max musi zawierac calkowite >= 1")
+        if any(not 0 <= v <= 1 for v in self.signal_depth_prob):
+            raise ValueError("signal_depth_prob musi byc w [0, 1]")
         for name in ("depth_mode_prob", "features_full_prob", "splitter_random_prob"):
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} musi byc w [0, 1]")
@@ -78,6 +97,17 @@ class SamplingConfig:
             raise ValueError("bootstrap_bounds musi byc dodatnie i rosnace")
         if not self.classification_criteria or not self.regression_criteria:
             raise ValueError("Listy criterion nie moga byc puste")
+
+
+def apply_signal_rule(config: SamplingConfig, signal: float) -> SamplingConfig:
+    """Stale zlozonosci po regule sygnalu (dla signal_rule='none' bez zmian)."""
+    if config.signal_rule == "none":
+        return config
+    high = int(signal >= config.signal_threshold)
+    changes = {"leaf_max": config.signal_leaf_max[high]}
+    if config.signal_rule == "leaf_depth":
+        changes["depth_mode_prob"] = config.signal_depth_prob[high]
+    return replace(config, **changes)
 
 
 def _check_task(task, n_samples, n_features):
